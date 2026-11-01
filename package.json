@@ -1,0 +1,21 @@
+{
+  "name": "pi-goal",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A small, persistent goal loop for Pi: set a goal, let the agent work, independently evaluate whether to continue.",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  }
+}

@@ -1,0 +1,10 @@
+# Runtime evidence can contain private prompts, tool output and session identities.
+artifacts/
+
+# Local dependencies, caches and test output.
+node_modules/
+coverage/
+.cache/
+*.log
+*.tsbuildinfo
+.DS_Store

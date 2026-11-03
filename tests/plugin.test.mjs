@@ -1,5 +1,7 @@
 // Independent offline acceptance tests. Never load user/project settings or credentials.
-import test, { after, afterEach } from 'node:test';
+import test, { after, afterEach, mock } from 'node:test';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync, watch, writeFileSync } from 'node:fs';
@@ -170,7 +172,9 @@ function conversation(sm, text = 'Task finished') {
 function answer(verdict = 'continue', model = classifier) {
   return { provider: model.provider, model: model.id, api: model.api, answers: { next: {
     type: 'choice', choice: verdict, confidence: 0.95, probabilities: { [verdict]: 0.95 },
-  } }, usage: { ...usage, cost: { ...usage.cost, total: 0.012 } }, stopReason: 'stop', timestamp: Date.now() };
+  }, reason: { type: 'choice', choice: verdict === 'correct' ? 'no_action' : 'none', confidence: .9,
+    probabilities: { [verdict === 'correct' ? 'no_action' : 'none']: .9 } } },
+    usage: { ...usage, cost: { ...usage.cost, total: 0.012 } }, stopReason: 'stop', timestamp: Date.now() };
 }
 function state(sm) {
   const entries = sm.getBranch().filter(e => e.type === 'custom' && e.customType === 'pi-goal');
@@ -687,26 +691,42 @@ test('before_agent_start allows custom steering while running; agent_settled res
 
 for (const action of ['clear', 'shutdown', 'replace inline', 'branch']) {
   test(`${action} disposes the previous file watcher`, async () => {
-    const h = await harness();
-    await h.command('Branch-owned inline goal');
-    const inlineLeaf = h.sm.getLeafId();
-    h.file = path.join(h.cwd, 'owned.md');
-    writeFileSync(h.file, 'File owned by previous state');
-    await h.command('./owned.md');
-    if (action === 'clear') await h.command('clear');
-    if (action === 'shutdown') await h.runner.emit({ type: 'session_shutdown', reason: 'reload' });
-    if (action === 'replace inline') await h.command('Replacement inline goal');
-    if (action === 'branch') {
-      const oldLeafId = h.sm.getLeafId();
-      h.sm.branch(inlineLeaf);
-      await h.runner.emit({ type: 'session_tree', newLeafId: inlineLeaf, oldLeafId });
-    }
-    const prior = state(h.sm), count = starts(h).length, notices = h.notices.length;
-    await fileEvent(h.file, () => writeFileSync(h.file, 'Abandoned source must never dispatch'));
-    await fileEvent(h.file, () => unlinkSync(h.file));
-    assert.deepEqual(state(h.sm), prior);
-    assert.equal(starts(h).length, count, 'Disposed watcher cannot append work');
-    assert.equal(h.notices.length, notices, 'Disposed watcher cannot issue source warnings');
+    // Observe the real owned resource's close event, not an unrelated OS event
+    // observer whose backend may not yet be ready after a fresh watch().
+    const owned = [];
+    const originalWatch = fs.watch;
+    const spy = mock.method(fs, 'watch', (...args) => {
+      const watcher = originalWatch(...args), closed = deferred();
+      watcher.once('close', () => closed.resolve());
+      owned.push({ watcher, closed });
+      return watcher;
+    });
+    syncBuiltinESMExports();
+    try {
+      const h = await harness();
+      await h.command('Branch-owned inline goal');
+      const inlineLeaf = h.sm.getLeafId();
+      h.file = path.join(h.cwd, 'owned.md');
+      writeFileSync(h.file, 'File owned by previous state');
+      await h.command('./owned.md');
+      assert.equal(owned.length, 1, 'A real source directory watcher was created');
+      if (action === 'clear') await h.command('clear');
+      if (action === 'shutdown') await h.runner.emit({ type: 'session_shutdown', reason: 'reload' });
+      if (action === 'replace inline') await h.command('Replacement inline goal');
+      if (action === 'branch') {
+        const oldLeafId = h.sm.getLeafId();
+        h.sm.branch(inlineLeaf);
+        await h.runner.emit({ type: 'session_tree', newLeafId: inlineLeaf, oldLeafId });
+      }
+      await bounded(owned[0].closed.promise, 'native Goal watcher closes');
+      const prior = state(h.sm), count = starts(h).length, notices = h.notices.length;
+      writeFileSync(h.file, 'Abandoned source must never dispatch');
+      unlinkSync(h.file);
+      await nextTurn();
+      assert.deepEqual(state(h.sm), prior);
+      assert.equal(starts(h).length, count, 'Disposed watcher cannot append work');
+      assert.equal(h.notices.length, notices, 'Disposed watcher cannot issue source warnings');
+    } finally { spy.mock.restore(); syncBuiltinESMExports(); }
   });
 }
 
@@ -817,12 +837,12 @@ test('native context injection survives real compaction and removes stale/duplic
   assert.equal((await h.runner.emitContext(first)).some(m => m.customType === 'pi-goal-context'), false);
 });
 
-for (const verdict of ['continue', 'met', 'waiting', 'input']) {
+for (const verdict of ['continue', 'correct', 'met', 'waiting', 'input']) {
   test(`native runner + AgentSession boundary projection/commit: ${verdict}`, async () => {
     const h = await active();
     h.setVerdict(verdict);
     const before = h.sm.getBranch().length;
-    assert.equal(await h.boundary(), verdict === 'continue');
+    assert.equal(await h.boundary(), verdict === 'continue' || verdict === 'correct');
     assert.equal(h.sm.getBranch().length, before + 2, 'State and feedback drafts committed natively');
     const result = state(h.sm);
     assert.equal(result.status, verdict);
@@ -835,7 +855,8 @@ for (const verdict of ['continue', 'met', 'waiting', 'input']) {
     assert.equal(call.options.maxRetries, 0);
     assert.equal(call.options.timeoutMs, 30_000);
     assert.equal(call.options.signal.aborted, false);
-    assert.deepEqual(Object.keys(call.context.questions.next.criteria), ['continue', 'met', 'waiting', 'input']);
+    assert.deepEqual(Object.keys(call.context.questions.next.criteria), ['continue', 'correct', 'met', 'waiting', 'input']);
+    assert.deepEqual(Object.keys(call.context.questions.reason.criteria), ['none', 'evidence_conflict', 'no_action', 'off_goal', 'invalid_wait', 'premature_completion']);
     await h.runner.emit({ type: 'agent_settled', aborted: false });
     await h.command('');
     assert.match(h.sent.at(-1).message.content, new RegExp(`Goal \\[${verdict}\\]`));
@@ -946,7 +967,7 @@ for (const action of ['clear', 'replace', 'queue', 'abort', 'shutdown', 'tree'])
   });
 }
 
-for (const verdict of ['continue', 'met', 'waiting', 'input']) {
+for (const verdict of ['continue', 'correct', 'met', 'waiting', 'input']) {
   test(`host pre-settlement Escape gap: committed ${verdict} is rolled back to active/interrupted`, async () => {
     const started = deferred(), finish = deferred();
     const h = await active({ classify: async () => { started.resolve(); return await finish.promise; } });
@@ -1168,4 +1189,84 @@ test('large-context classifiers retain the bounded evidence/cost ceiling', async
   assert.equal(budget.budgetBytes, 60_000);
   assert.ok(budget.requestBytes <= 60_000);
   assert.equal(budget.possiblyTruncated, true);
+});
+
+for (const [reason, instruction] of [
+  ['evidence_conflict', '分别处理成功与失败'],
+  ['no_action', '执行一项授权内的有效工作'],
+  ['off_goal', '停止无关扩展'],
+  ['invalid_wait', '依赖已解除时接续后续工作'],
+  ['premature_completion', '撤回缺少依据的完成判断'],
+]) {
+  test(`correct/${reason} persists a targeted, model-visible correction and continues`, async () => {
+    const h = await active({ classify: async (m, context) => {
+      assert.equal(context.questions.reason.type, 'choice');
+      const r = answer('correct', m);
+      r.answers.reason.choice = reason;
+      r.answers.reason.confidence = .87;
+      return r;
+    } });
+    const before = state(h.sm);
+    assert.equal(await h.boundary(), true);
+    const after = state(h.sm);
+    assert.equal(h.classifications().length, 1, 'one native request, not a second classifier pass');
+    assert.equal(after.status, 'correct');
+    assert.equal(after.last.reason, reason);
+    assert.equal(after.last.reasonConfidence, .87);
+    sameIdentity({ ...after, checks: before.checks, costUsd: before.costUsd }, before);
+    assert.equal(after.text, before.text);
+    assert.equal(after.checks, before.checks + 1);
+    assert.equal(after.costUsd, before.costUsd + .012);
+    const feedback = drafts(h.sm).at(-1);
+    assert.match(feedback.content, new RegExp(`Goal: correct \\[${reason}\\]`));
+    assert.ok(feedback.content.includes(instruction));
+    assert.equal(feedback.details.reason, reason);
+    assert.ok(h.sm.buildSessionProjection().messages.some(m => m.customType === 'pi-goal-feedback' && m.content.includes(instruction)));
+    await h.command('');
+    assert.match(h.sent.at(-1).message.content, /Goal \[correct\]/);
+    assert.ok(h.sent.at(-1).message.content.includes(reason));
+  });
+}
+
+for (const malformed of [undefined, { type: 'bool', probability: 1 },
+  { type: 'choice', choice: 'none' }, { type: 'choice', choice: 'invented_reason' }]) {
+  test(`correct with invalid reason ${JSON.stringify(malformed)} yields without changing Goal`, async () => {
+    const h = await active({ classify: async m => {
+      const r = answer('correct', m);
+      if (malformed === undefined) delete r.answers.reason;
+      else r.answers.reason = malformed;
+      return r;
+    } });
+    const before = state(h.sm);
+    assert.equal(await h.boundary(), false);
+    assert.equal(h.classifications().length, 1);
+    assert.equal(state(h.sm).status, 'error');
+    assert.equal(state(h.sm).text, before.text);
+    assert.equal(state(h.sm).id, before.id);
+    assert.equal(state(h.sm).last.reason, undefined);
+    assert.match(state(h.sm).last.error, /Invalid correction reason/);
+  });
+}
+
+test('non-correct legacy results and old persisted entries need no reason migration', async () => {
+  const h = await active({ classify: async m => {
+    const r = answer('waiting', m); delete r.answers.reason; return r;
+  } });
+  assert.equal(await h.boundary(), false);
+  assert.equal(state(h.sm).status, 'waiting');
+  assert.equal(state(h.sm).last.reason, undefined);
+  const old = state(h.sm);
+  await h.runner.emit({ type: 'session_start', reason: 'reload' });
+  assert.deepEqual(state(h.sm), old);
+  assert.equal(h.classifications().length, 1, 'restore does not make an extra request');
+});
+
+test('stale correct verdict cannot override a cleared Goal', async () => {
+  const started = deferred(), finish = deferred();
+  const h = await active({ classify: async () => { started.resolve(); return finish.promise; } });
+  const pending = h.boundary(); await started.promise;
+  await h.command('clear'); finish.resolve(answer('correct'));
+  assert.equal(await pending, false);
+  assert.equal(state(h.sm), undefined);
+  assert.equal(drafts(h.sm).filter(d => d.details?.reason).length, 0);
 });

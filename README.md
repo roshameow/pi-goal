@@ -52,9 +52,28 @@ At final settlement (not after every tool), the classifier chooses:
 | Verdict | Behavior |
 |---|---|
 | `continue` | Add feedback and ask the same agent to take the next useful action. |
+| `correct` | Send targeted correction feedback and continue the same agent within the unchanged Goal and permissions. |
 | `met` | End the loop for a one-shot goal, retaining its status. This is a model judgment, not independent business verification. |
 | `waiting` | Keep the goal; yield to existing external work/notifications or the next period. |
 | `input` | Keep the goal; yield for a genuine user decision or access requirement. |
+
+### Correction feedback
+
+One native classification request answers two typed questions: `next` (the five verdicts above) and `reason`. When `next=correct`, `reason` must identify one supported issue:
+
+| Reason | Corrective direction |
+|---|---|
+| `evidence_conflict` | Reconcile the response with the newest available evidence; distinguish successful and failed substeps. |
+| `no_action` | Stop merely repeating plans/status; take a useful authorized action, or identify the real blocker. |
+| `off_goal` | Return to the current Goal and latest user instructions without expanding scope. |
+| `invalid_wait` | Check whether the claimed dependency still applies; proceed when it has been resolved. |
+| `premature_completion` | Withdraw an unsupported completion claim and address missing acceptance evidence/work. |
+
+Other verdicts use `reason=none`. A missing/unsupported reason for `correct` is a malformed evaluation: keep the Goal, report the error and yield without retry. Existing saved Goals need no migration. `/goal` and saved feedback show the latest reason/confidence; correction feedback is model-visible through the existing native settlement boundary.
+
+These are generic Goal/action/evidence judgments, not project-specific status parsers or business rules. They do not modify the Goal, grant permissions, force tools, rerun external actions, impose a turn budget, or guarantee the agent will comply. Truncated evidence is explicitly marked; the classifier must not invent missing facts. Normal difficulties, valid external waiting and an explicit user pause must not be treated as misconduct. `correct` requests a next run just like `continue`, rather than ending the Goal.
+
+The two answers share **one request to the already-selected classifier**; there is no second model, provider switch or extra retry. The extra question can increase provider-billed input/output usage. Both questions and their criteria are included in the existing input budget.
 
 Each classification uses a 30-second deadline and no client retries. A failed/malformed classification preserves the goal and reports the error without retrying or automatically continuing. It can be evaluated again after the next normal prompt/notification. Aborted/error agent runs and already-queued work are not restarted by this plugin.
 
